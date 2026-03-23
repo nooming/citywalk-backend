@@ -9,6 +9,8 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+from parking_api import parking_bp
+
 # ==================== 基础配置 ====================
 import os
 
@@ -34,8 +36,16 @@ CORS(app, resources={
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
         "supports_credentials": False
+    },
+    r"/api/.*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+        "supports_credentials": False
     }
 })
+
+app.register_blueprint(parking_bp)
 
 # 静态文件服务 - 支持前端直接访问
 @app.route('/')
