@@ -1,6 +1,12 @@
 """
-小区停车 PSO：场景参数化（供 Web 与脚本共用）。
-坐标系：左下角 (0,0)，右上角 (lot_width, lot_height)。默认示例地块约 100m×100m（常见住宅小区尺度）。
+小区停车分配：场景建模、步行/行车几何、匈牙利精确解与 PSO 近似解。
+
+坐标系：原点在地块左下角 (0, 0)，x、y 单位为米；地块范围由 lot.width、lot.height 限定。
+
+注释约定：
+    - 分段使用「# --- 标题 ---」与常量组说明；
+    - 对外可调用的函数使用文档字符串说明入参/返回值；
+    - 行内注释说明非显而易见的约束或与前端约定的字段（见 articles/parking-pso 中 app.js）。
 """
 from __future__ import annotations
 
@@ -11,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-# 默认 PSO 参数
+# --- PSO 默认超参数 ---
 N_PARTICLES_DEFAULT = 40
 N_ITER_DEFAULT = 600
 W_DEFAULT = 0.7
@@ -19,24 +25,25 @@ C1_DEFAULT = 1.5
 C2_DEFAULT = 1.5
 V_MAX_DEFAULT = 0.25
 
-# 车位贴合内环道路（与前端 SNAP_* 一致）：约 5m 车长沿路、2.5m 车宽（轴对齐绘制）
+# --- 车位与建筑几何（与前端 app.js 中 B、SNAP_* 保持一致）---
+# 车位贴合内环：约 5 m 车长沿路、2.5 m 车宽（轴对齐绘制）
 SLOT_SNAP_MARGIN = 0.45
-# 东/西竖向停车带：朝路方向为车长的一半（≈2.5m），内缩与 SLOT_ROAD_INSET 一致
+# 东、西停车带：沿路内缩，与 SLOT_ROAD_INSET 一致
 SLOT_ROAD_INSET = 2.55
-# 南/北横向停车带：朝路方向为车宽的一半（1.25m）；若与东西共用同一内缩会多出约 1.3m 视觉空隙
+# 南、北停车带：车宽方向半宽 + 边距；与东西带共用同一内缩时会产生视觉空隙，故单独参数
 SLOT_BERTH_WIDTH = 2.5
 SLOT_HALF_BERTH_W = SLOT_BERTH_WIDTH / 2.0
 
-# 步行绕障：非目的楼的 footprint（与 Web 前端 B.bw × B.bh 一致）
+# 步行绕障：非目的楼矩形 footprint（对应前端 B.bw × B.bh）
 BUILDING_FOOTPRINT_W = 11.0
 BUILDING_FOOTPRINT_H = 7.0
-# Web / Matplotlib 中车位轴对齐矩形（米），与前端 B.sw × B.sh 一致
+# 车位在平面中的轴对齐尺寸（米），对应前端 B.sw × B.sh；绘图与引擎一致
 SLOT_VIS_LENGTH_M = 5.0
 SLOT_VIS_WIDTH_M = 2.5
 
 
 def default_scenario() -> Dict[str, Any]:
-    # 约 100m×100m 住宅小区地块；由原 30m 教学沙盘同比例放大，拓扑不变
+    """返回约 100 m × 100 m 的演示场景（由 30 m 教学沙盘等比放大，拓扑不变）。"""
     lot_w, lot_h = 100.0, 100.0
     k = lot_w / 30.0
     entrance = [7.0 * k, 6.0 * k]
@@ -414,13 +421,11 @@ def driving_distance_from_entrance(
     slot_xy: np.ndarray, inner: Dict[str, float], entrance: np.ndarray
 ) -> float:
     """
-    行车距离（示意模型，贴近「沿内环开到车位旁再驶入」）：
+    行车距离（示意模型）：沿内环行驶至车位一侧再水平驶入。
 
-    - 入口 ``(ex,ey)`` 视为在内环边上（归一化时会吸附到内环矩形四边）。
-    - **左侧车位**（车位中心 x < 内环水平中点）：先沿内环周界走到左边路上的接入点
-      ``(ix0, sy)``（sy 为车位纵坐标夹到 [iy0, iy1]），再水平驶到车位中心。
-    - **右侧车位**：同理，接入点为 ``(ix1, sy)``。
-    - 环上两点间路程 = 沿矩形边界**较短**的一侧（不再先绕到左下角）。
+    入口 (ex, ey) 视为贴内环边（normalize 时已吸附到矩形四边）。
+    车位中心 x 小于内环水平中点时走左侧接入点 (ix0, sy)，否则走 (ix1, sy)；
+    sy 为车位纵坐标限制在 [iy0, iy1] 内。环上两点间取矩形边界较短弧长。
     """
     ix0, ix1 = inner["x_min"], inner["x_max"]
     iy0, iy1 = inner["y_min"], inner["y_max"]
@@ -581,6 +586,7 @@ def snap_slot_to_road(
 
 
 def normalize_scenario(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """深拷贝并补齐场景字段，应用车位/入口吸附、n_veh 上界与 vehicle_destinations 规范化。"""
     s = copy.deepcopy(raw)
     lot = s.get("lot") or {}
     lw = float(lot.get("width", 100))
@@ -591,7 +597,7 @@ def normalize_scenario(raw: Dict[str, Any]) -> Dict[str, Any]:
     s.setdefault("obstacle", default_scenario()["obstacle"])
     s["buildings"] = [[float(p[0]), float(p[1])] for p in s.get("buildings") or []]
     s["slots"] = [[float(p[0]), float(p[1])] for p in s.get("slots") or []]
-    # 固定开启：车位沿内环停车带、入口吸附内环（Web 已去掉开关，请求体中的 false 也会被覆盖）
+    # 车位吸附停车带、入口吸附内环：与前端一致，始终开启；请求中若为 false 也会被覆盖
     snap_road = True
     snap_ent = True
     s["constraints"] = {
@@ -681,7 +687,7 @@ def precompute_from_normalized(
         [driving_distance_from_entrance(slot_xy, inner, entrance) for slot_xy in slots_pos],
         dtype=float,
     )
-    # 同一目的楼下障碍集合相同，勿对每个车位重复构造
+    # 同一目的楼对应同一组障碍矩形，按目的楼索引缓存，避免对每个车位重复构造
     boxes_by_bi = [
         walk_blocking_boxes(obs, buildings_pos, bi) for bi in range(n_b)
     ]
@@ -806,7 +812,7 @@ def run_optimize(
     v_car, v_walk = 10.0, 1.5
 
     if m == "exact":
-        # cost[i,j] = 车 i 用车位 j 的行车时间 + 步行时间（全局最小权匹配）
+        # 代价矩阵 cost[i,j]：车 i 使用车位 j 的行车时间 + 步行时间；匈牙利算法求全局最小权匹配
         cost = drive_dist.reshape(1, -1) / v_car + walk_mat[:, veh_targets].T / v_walk
         row_ind, col_ind = linear_sum_assignment(cost)
         best_assign = np.empty(n_veh, dtype=int)

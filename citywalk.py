@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+"""
+Citywalk 路线规划：调用高德 REST API，提供 /plan、/locate_city、/search_image。
+
+停车分配接口由 parking_api 蓝图挂载（/api/default、/api/optimize），在下方 register_blueprint 注册。
+"""
 import json
 import logging
 import time
@@ -16,14 +21,13 @@ import os
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 
-# 修复1：放宽CORS配置（兼容所有前端域名，开发阶段优先）
-# 使用CORS扩展处理跨域，不再手动添加响应头，避免重复
+# 跨域：公开接口，允许任意 Origin；由 flask-cors 统一加响应头，避免与各路由重复设置
 CORS(app, resources={
     r"/plan": {
         "origins": "*",
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
-        "supports_credentials": False  # 当origins为*时，不能设置credentials
+        "supports_credentials": False  # origins 为 * 时不可携带凭据
     },
     r"/locate_city": {
         "origins": "*",
@@ -53,10 +57,10 @@ def index():
     """主页 - 返回 index.html"""
     return app.send_static_file('index.html')
 
-# ！！！替换为你自己的高德API Key（必须开通：地理编码、步行路线、POI搜索权限）！！！
-AMAP_KEY = "083ed6a4ffab4ab6aded4ecc383a30bb"  # 示例："083ed6a4ffab4ab6aded4ecc383a30bb"
+# 注意：高德 Key 建议在控制台配置域名白名单；需开通地理编码、步行路径、周边搜索等权限
+AMAP_KEY = "083ed6a4ffab4ab6aded4ecc383a30bb"
 
-# 高德静态地图API Key（专门用于生成背景图）
+# 高德静态地图（卫星/路网底图）专用 Key
 AMAP_STATIC_MAP_KEY = "a84ad5d57a96deaa8116818ef1a1ab67"
 
 # ==================== 核心配置（含POI过滤规则） ====================
@@ -589,55 +593,45 @@ def generate_new_route(start: Tuple[float, float], end: Tuple[float, float],
     }
 
 
-# ==================== 核心接口（修复400错误） ====================
+# ==================== 核心接口：/plan ====================
 @app.route('/plan', methods=['POST', 'OPTIONS'])
 def plan_route():
-    """核心接口：最短路线→沿路线选高价值POI→筛选→新路线（支持全国任意城市）"""
-    # 处理预检请求 - CORS扩展会自动处理响应头
+    """最短路线 → 沿路采样选 POI → 筛选 → 重规划路线（支持全国城市）。"""
     if request.method == 'OPTIONS':
         return jsonify({"success": True})
 
     try:
-        # 修复：兼容所有请求格式（解决参数解析失败导致的400）
         data = {}
         if request.is_json:
-            data = request.get_json(silent=True) or {}  # 静默解析，避免JSON格式错误抛异常
+            data = request.get_json(silent=True) or {}  # 静默解析，非法 JSON 不抛异常
         else:
-            # 兼容form-data/x-www-form-urlencoded
             data = request.form.to_dict() or request.args.to_dict()
 
-        # 参数处理：兼容前端传来的坐标数组或地址字符串
         start_raw = data.get("start", "")
         end_raw = data.get("end", "")
-        plan_time = int(data.get("plan_time", 60))  # 兜底60分钟
+        plan_time = int(data.get("plan_time", 60))  # 默认 60 分钟
         poi_type = data.get("poi_type", "无偏好").strip() or "无偏好"
-        target_city = data.get("city", "").strip() or None  # 目标城市（新增参数）
+        target_city = data.get("city", "").strip() or None
 
-        # 解析起点：支持 [lng, lat] 数组或地址字符串
         start_lng, start_lat = None, None
         if isinstance(start_raw, list) and len(start_raw) == 2:
-            # 前端传来的是坐标数组 [lng, lat]
             start_lng, start_lat = float(start_raw[0]), float(start_raw[1])
             start_address = f"{start_lng},{start_lat}"
         elif isinstance(start_raw, str) and start_raw.strip():
-            # 传来的是地址字符串
             start_address = start_raw.strip()
         else:
-            start_address = "北京市东城区天安门"  # 兜底默认值改为北京
+            start_address = "北京市东城区天安门"  # 缺省起点
 
-        # 解析终点：支持 [lng, lat] 数组或地址字符串
         end_lng, end_lat = None, None
         if isinstance(end_raw, list) and len(end_raw) == 2:
-            # 前端传来的是坐标数组 [lng, lat]
             end_lng, end_lat = float(end_raw[0]), float(end_raw[1])
             end_address = f"{end_lng},{end_lat}"
         elif isinstance(end_raw, str) and end_raw.strip():
-            # 传来的是地址字符串
             end_address = end_raw.strip()
         else:
-            end_address = "北京市西城区王府井"  # 兜底默认值改为北京
+            end_address = "北京市西城区王府井"  # 缺省终点
 
-        # 友好的参数校验（返回明确错误，而非直接400）
+        # 参数校验：返回明确 message，避免无说明的 400
         error_msg = None
         if plan_time < 10 or plan_time > 240:
             error_msg = "计划时间需在10-240分钟之间"
@@ -647,8 +641,7 @@ def plan_route():
         if error_msg:
             return jsonify({"success": False, "message": error_msg}), 400
 
-        # 2. 第一步：获取起点→终点的最短路线
-        # 如果前端传来的是坐标数组，直接使用；否则进行地理编码
+        # 起点—终点最短步行路线；坐标已给则跳过地理编码
         if start_lng is None or start_lat is None:
             start_lng, start_lat = get_geo_code(start_address, target_city)
         if end_lng is None or end_lat is None:
@@ -666,13 +659,13 @@ def plan_route():
         shortest_route = get_shortest_route(start, end)
         logging.info(f"最短路线：距离{shortest_route['total_distance']}米，耗时{shortest_route['total_duration']}分钟")
 
-        # 3. 第二步：沿最短路线采样高价值POI（过滤无效/低价值）
+        # 沿路采样 POI（类型与权重见 VALID_POI_WEIGHT）
         route_pois = sample_poi_along_shortest_route(shortest_route["route_points"], poi_type, target_city)
         if not route_pois:
             return jsonify({
                 "success": True,
                 "message": "沿最短路线未找到符合条件的高价值POI",
-                # 前端期望的字段
+                # 与前端约定的空结果字段结构
                 "path": shortest_route["route_points"],
                 "distance": shortest_route["total_distance"],
                 "duration": shortest_route["total_duration"],
@@ -686,20 +679,17 @@ def plan_route():
                 "new_route": {}
             }), 200
 
-        # 4. 第三步：筛选POI（匹配计划时间）
+        # 按 plan_time 筛选 POI 子集
         filtered_pois = filter_poi_for_route(route_pois, plan_time, shortest_route["total_duration"])
 
-        # 5. 第四步：基于筛选后的POI生成新路线
+        # 途经筛选后的 POI 重新规划路线
         new_route = generate_new_route(start, end, filtered_pois)
 
-        # 6. 返回结果（确保跨域头）
-        # 构建前端期望的数据格式
-        # 判断新路线是否有效（有路径点且距离>0）
+        # 新路线无效（无点或距离为 0）时回退为原始最短路线
         new_route_valid = (new_route.get("new_route_points") and
                           len(new_route.get("new_route_points", [])) > 0 and
                           new_route.get("new_total_distance", 0) > 0)
 
-        # 使用新路线的数据（如果有效），否则使用原始路线
         route_points = new_route["new_route_points"] if new_route_valid else shortest_route["route_points"]
         total_distance = new_route["new_total_distance"] if new_route_valid else shortest_route["total_distance"]
         total_duration = new_route["new_total_duration"] if new_route_valid else shortest_route["total_duration"]
@@ -707,12 +697,10 @@ def plan_route():
         return jsonify({
             "success": True,
             "message": "路线规划成功",
-            # 前端期望的字段
-            "path": route_points,  # 路线坐标点数组
-            "distance": total_distance,  # 总距离（米）
-            "duration": total_duration,  # 总耗时（分钟）
-            "pois": filtered_pois,  # POI列表
-            # 保留详细数据供参考
+            "path": route_points,
+            "distance": total_distance,
+            "duration": total_duration,
+            "pois": filtered_pois,
             "original_route": {
                 "start": start_address,
                 "end": end_address,
