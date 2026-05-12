@@ -224,6 +224,22 @@ def haversine(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     return c * r
 
 
+def parse_location(location_str: str) -> Optional[Tuple[float, float]]:
+    """解析 'lng,lat' 字符串，失败返回 None（替代裸 split 防止 ValueError）。"""
+    try:
+        parts = str(location_str).split(",")
+        if len(parts) != 2:
+            return None
+        return float(parts[0]), float(parts[1])
+    except (ValueError, AttributeError):
+        return None
+
+
+def _location_grid_key(lng: float, lat: float) -> Tuple[int, int]:
+    """坐标转网格 key（每格约 55m），用于 O(1) 近邻去重。"""
+    return (round(lat * 2000), round(lng * 2000))
+
+
 def get_geo_code(address: str, city: str = None) -> Tuple[float, float]:
     """地址转经纬度（支持全国任意城市）"""
     url = "https://restapi.amap.com/v3/geocode/geo"
@@ -258,12 +274,10 @@ def normalize_city_name(city: str) -> str:
     """城市名规范化：去后缀、空白与大小写差异。"""
     if not city:
         return ""
+    import re
     normalized = city.strip().lower().replace(" ", "")
-    suffixes = ("特别行政区", "自治州", "地区", "盟", "州", "市")
-    for suffix in suffixes:
-        if normalized.endswith(suffix):
-            normalized = normalized[:-len(suffix)]
-            break
+    # 用正则一次性剥离末尾行政区后缀（从长到短自动匹配）
+    normalized = re.sub(r'(特别行政区|自治州|地区|盟|州|市|区|县|省)$', '', normalized)
     return normalized
 
 
@@ -411,7 +425,10 @@ def get_shortest_route(start: Tuple[float, float], end: Tuple[float, float]) -> 
             raise ValueError(f"获取最短路线失败：{data.get('info', '未知错误')}")
 
         # 提取最短路线（paths[0]默认是最短）
-        path = data["route"]["paths"][0]
+        paths = data["route"]["paths"]
+        if not paths:
+            raise ValueError("高德步行路线API返回空路径列表")
+        path = paths[0]
         # 解析路线的经纬度点（按顺序）
         route_points = []
         total_distance = int(path["distance"])
@@ -419,8 +436,9 @@ def get_shortest_route(start: Tuple[float, float], end: Tuple[float, float]) -> 
 
         for step in path["steps"]:
             for point_str in step["polyline"].split(";"):
-                lng, lat = map(float, point_str.split(","))
-                route_points.append((lng, lat))
+                loc = parse_location(point_str)
+                if loc:
+                    route_points.append(loc)
 
         return {
             "route_points": route_points,  # 最短路线的所有经纬度点（按顺序）
@@ -479,7 +497,7 @@ def sample_poi_along_shortest_route(route_points: List[Tuple[float, float]],
 
     all_pois = []
     used_poi_names = set()
-    used_poi_locations = set()  # 用于坐标去重（避免同一地点不同名称的重复）
+    used_grid_cells: set = set()  # 网格去重（O(1)替代O(n²)haversine遍历，每格≈55m）
     debug_stats = {
         "total_raw_pois": 0,
         "filtered_by_city": 0,
@@ -508,7 +526,7 @@ def sample_poi_along_shortest_route(route_points: List[Tuple[float, float]],
 
         sample_candidates = []
         sample_seen_names = set()
-        sample_seen_locations = set()
+        sample_grid_cells: set = set()
         sample_debug = {"sample_idx": idx, "raw_page1": 0, "raw_page2": 0, "kept": 0}
 
         try:
@@ -543,26 +561,25 @@ def sample_poi_along_shortest_route(route_points: List[Tuple[float, float]],
                         continue
 
                     # 格式化POI（保留离路线的距离，用于排序）
-                    poi_lng, poi_lat = map(float, poi.get("location", "0,0").split(","))
+                    loc = parse_location(poi.get("location", ""))
+                    if loc is None:
+                        debug_stats["filtered_by_name_or_location"] += 1
+                        continue
+                    poi_lng, poi_lat = loc
 
                     # 去重检查1：按名称去重
                     if poi_name in used_poi_names or poi_name in sample_seen_names:
                         debug_stats["filtered_by_name_or_location"] += 1
                         continue
 
-                    # 去重检查2：按坐标去重（同一地点50米范围内视为同一POI）
-                    is_duplicate_location = False
-                    for used_lng, used_lat in used_poi_locations:
-                        if haversine(poi_lng, poi_lat, used_lng, used_lat) < 50:  # 50米内视为同一地点
-                            is_duplicate_location = True
-                            logging.debug(f"坐标去重：{poi_name} 与已有POI位置重复（<50米）")
-                            break
-                    if not is_duplicate_location:
-                        for used_lng, used_lat in sample_seen_locations:
-                            if haversine(poi_lng, poi_lat, used_lng, used_lat) < 50:
-                                is_duplicate_location = True
-                                break
-                    if is_duplicate_location:
+                    # 去重检查2：网格去重，O(1) 检查 3×3 邻格（覆盖约 55m 范围）
+                    poi_gk = _location_grid_key(poi_lng, poi_lat)
+                    neighbors = [
+                        (poi_gk[0] + dr, poi_gk[1] + dc)
+                        for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                    ]
+                    if any(k in used_grid_cells or k in sample_grid_cells for k in neighbors):
+                        logging.debug(f"坐标去重：{poi_name} 与已有POI位置重复（≈55m内）")
                         debug_stats["filtered_by_name_or_location"] += 1
                         continue
 
@@ -605,14 +622,14 @@ def sample_poi_along_shortest_route(route_points: List[Tuple[float, float]],
                         "sample_idx": idx  # 记录属于哪个采样点
                     })
                     sample_seen_names.add(poi_name)
-                    sample_seen_locations.add((poi_lng, poi_lat))
+                    sample_grid_cells.add(_location_grid_key(poi_lng, poi_lat))
             # 每个采样点优先保留综合分更高的 POI，避免全由最近点占满
             sample_candidates.sort(key=lambda x: (-x["final_score"], x["dist_to_route"]))
             selected_candidates = sample_candidates[:POI_PER_SAMPLE]
             all_pois.extend(selected_candidates)
             for picked in selected_candidates:
                 used_poi_names.add(picked["name"])
-                used_poi_locations.add((picked["location"][0], picked["location"][1]))
+                used_grid_cells.add(_location_grid_key(picked["location"][0], picked["location"][1]))
             sample_debug["kept"] = len(selected_candidates)
             debug_stats["kept_pois"] += len(selected_candidates)
         except Exception as e:
@@ -751,7 +768,11 @@ def generate_new_route(start: Tuple[float, float], end: Tuple[float, float],
                 logging.warning(f"分段路线{i+1}规划失败：{data.get('info', '未知错误')}")
                 continue
 
-            seg_path = data["route"]["paths"][0]
+            paths = data["route"]["paths"]
+            if not paths:
+                logging.warning(f"分段路线{i+1}返回空路径，跳过")
+                continue
+            seg_path = paths[0]
             total_distance += int(seg_path.get("distance", 0))
             total_walk_duration += int(seg_path.get("duration", 0)) // 60
 
@@ -763,7 +784,7 @@ def generate_new_route(start: Tuple[float, float], end: Tuple[float, float],
                         try:
                             lng, lat = map(float, point_str.split(","))
                             all_route_points.append((lng, lat))
-                        except:
+                        except (ValueError, AttributeError):
                             continue
 
             # 添加短暂延迟避免API限流
@@ -1136,8 +1157,8 @@ def locate_city():
                         lng2, lat2 = map(float, coords[1].split(","))
                         center_lng = (lng1 + lng2) / 2
                         center_lat = (lat1 + lat2) / 2
-                except:
-                    pass
+                except (ValueError, AttributeError, IndexError) as e:
+                    logging.warning(f"解析IP定位矩形区域坐标失败：{e}")
 
             return jsonify({
                 "success": True,
